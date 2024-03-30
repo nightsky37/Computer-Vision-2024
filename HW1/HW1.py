@@ -1,10 +1,8 @@
 import cv2
 import numpy as np
 import open3d as o3d
-import matplotlib
-
-matplotlib.use('tkagg')
 import matplotlib.pyplot as plt
+import scipy
 
 
 # visualizing the mask (size : "image width" * "image height")
@@ -76,76 +74,141 @@ def getUnitLight():
             value = line[7:-2].split(',')
             value = [float(i) for i in value]
             light.append(value)
-
     light = np.array(light)
     light_norm=[]
     for l in light:
         light_norm.append(l/np.linalg.norm(l))
-
     light_norm = np.array(light_norm)
     return light_norm
 
-def getNormalMap():
+def getNormalMap(mask):
     normalmap = np.zeros(images[0].shape)
     light = getUnitLight()
     for x in range(images[0].shape[0]) :
         for y in range(images[0].shape[1]):
-            I = []
-            for i in range(6):
-                I.append(images[i][x][y])
-            I = np.array(I)
-            N_T = np.dot(np.dot(np.linalg.inv(np.dot(light.T, light)), light.T), I)        
-            N = N_T.T
-            
-            N_gray = N[0]*0.0722+N[1]*0.7152+N[2]*0.2126 # Kd*N
-            Nnorm = np.linalg.norm(N_gray)
+            if mask[x][y]!=0:
+                I = []
+                for i in range(6):
+                    I.append(images[i][x][y])
+                I = np.array(I)
+                N_T = np.dot(np.dot(np.linalg.inv(np.dot(light.T, light)), light.T), I)        
+                N = N_T.T
+                
+                N_gray = N[0]*0.0722+N[1]*0.7152+N[2]*0.2126 # Kd*N
+                Nnorm = np.linalg.norm(N_gray)
 
-            if Nnorm==0:
-                continue
-            normalmap[x][y] = N_gray/Nnorm                     
+                if Nnorm==0:
+                    continue
+                normalmap[x][y] = N_gray/Nnorm                     
     normalmap = normalmap.astype(np.float32)    
     return normalmap
 
 def getMask(image):
     image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(image_gray, 1, 255, cv2.THRESH_BINARY)
-    result = cv2.bitwise_and(image, image, mask=mask)
-    return result
+    lower_bound = 30 if obj == 'noisy_venus' else 1
+    _, mask = cv2.threshold(image_gray, lower_bound, 255, cv2.THRESH_BINARY)
+    print("image:", image_gray.shape)
+    return mask
 
-def getDepthMap():
-    h = normalmap.shape[0]
-    w = normalmap.shape[1]
-    P = np.zeros((h, w, 2), dtype=np.float32)
-    Q = np.zeros((h, w, 2), dtype=np.float32)
-    tempZ = np.zeros((h, w, 2), dtype=np.float32)
-    Z = np.zeros((h, w), dtype=np.float32)
-    mask = getMask(images[0])
+def getDepthMap(mask, normalmap):
+    img_h, img_w = mask.shape
+    N = np.reshape(normalmap, (image_row, image_col, 3))
+    print("N:", N.shape)
+    # return the index of non-zero value in mask along axis 0 and axis 1 respectively
+    obj_h, obj_w = np.where(mask!=0) 
+    print("mask shape:", mask.shape)
+    num_pixel = np.size(obj_h) 
+    print("num of pixels:", num_pixel)
+    # create a matrix storing the index of mask 
+    fullobj = np.zeros((img_h, img_w)).astype('int')
+    for i in range(num_pixel):
+        fullobj[obj_h[i], obj_w[i]] = i
+    
+    M = scipy.sparse.lil_matrix((2*num_pixel, num_pixel))
+    v = np.zeros((2*num_pixel, 1))
 
+    for i in range(num_pixel):
+        # pixel-wise calculation
+        h = obj_h[i]
+        w = obj_w[i]
+        nx = N[h, w, 0]
+        ny = N[h ,w ,1]
+        nz = N[h, w, 2]
+
+        # z(x+1, y)-z(x,y) = -nx/nz
+        row_idx = i*2 
+        if mask[h, w+1]:
+            idx_horizontal = fullobj[h, w+1]   
+            M[row_idx, i] = -1
+            M[row_idx, idx_horizontal] = 1
+            v[row_idx] = -nx/nz
+        elif mask[h, w-1]:
+            idx_horizontal = fullobj[h, w-1]
+            M[row_idx, i] = 1
+            M[row_idx, idx_horizontal] = -1
+            v[row_idx] = -nx/nz
+
+        # z(x, y+1)-z(x,y) = -ny/nz
+        row_idx = i*2+1
+        if  mask[h+1, w]:
+            idx_vertical = fullobj[h+1, w]
+            M[row_idx, i] = 1
+            M[row_idx, idx_vertical] = -1
+            v[row_idx] = -ny/nz
+        elif mask[h-1, w]:
+            idx_vertical = fullobj[h-1, w]
+            M[row_idx, i] = -1
+            M[row_idx, idx_vertical] = 1
+            v[row_idx] = -ny/nz
+    
+    # Mz = v => M.T*M*z = M.T*V => z = (M.T*M)^-1*M.T*V
+    Mt_M = M.T@M
+    Mt_V = M.T@v
+    z = scipy.sparse.linalg.spsolve(Mt_M, Mt_V)
+
+    if obj == 'venus':
+        z_std = np.std(z, ddof=1)
+        z_mean = np.mean(z)
+        z_normalize = (z-z_mean)/z_std
+
+        outlier_ind = np.abs(z_normalize)>10
+        z_min = np.min(z[~outlier_ind])
+        z_max = np.max(z[~outlier_ind])
+
+    Z = mask.astype('float')
+    for i in range(num_pixel):
+        h = obj_h[i]
+        w = obj_w[i]
+        if obj == 'venus':
+            Z[h, w] = (z[i]-z_min)/(z_max-z_min)*255
+        else:
+            Z[h, w] = z[i]
+    
+    return Z
 
 if __name__ == '__main__':
     images=[]
-    image_path=f'./test/star/pic' # bunny, star, venus, noisy_venus
-    light_path='./test/star/LightSource.txt'
+    obj = 'noisy_venus' # bunny, star, venus, noisy_venus
+    image_path=f'./test/{obj}/pic' 
+    light_path=f'./test/{obj}/LightSource.txt'
+    filepath = f'./result/{obj}.ply'    
 
     for i in range(1,7):
         img=read_bmp(image_path+f'{i}.bmp')
+        if obj=='noisy_venus':
+            # img = cv2.blur(img, (5,5))
+            img = cv2.GaussianBlur(img, (13, 13), 0)
         images.append(img)
-
     images = np.array(images)
-    normalmap=getNormalMap()
-    mask = getMask(images[0])
-    plt.figure()
-    plt.imshow(mask)
-    plt.title('mask')
 
+    mask = getMask(images[0])
+    normalmap=getNormalMap(mask)
+    Z = getDepthMap(mask, normalmap)
 
     normal_visualization(normalmap)
-
-
-
-    # depth_visualization(Z)
-    # save_ply(Z,filepath)
-    # show_ply(filepath)
+    depth_visualization(Z)
+    save_ply(Z,filepath)
+    show_ply(filepath)
 
     # showing the windows of all visualization function
     plt.show()
