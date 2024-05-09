@@ -3,6 +3,8 @@ import numpy as np
 import random
 import math
 import sys
+from PIL import Image, ImageChops
+from matplotlib import cm
 
 # read the image file & output the color & gray image
 
@@ -49,14 +51,18 @@ def SIFT(img_gray):
 
 def KNN(kps_l, kps_r, features_l, features_r):
     print("Finding good matches...")
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    bf = cv2.BFMatcher()
     features_l = features_l.astype('uint8')
     features_r = features_r.astype('uint8')
-    matches = bf.match(features_l, features_r)
+    matches = bf.knnMatch(features_l, features_r, k=2)
 
-    matches = sorted(matches, key=lambda x: x.distance)
+    # matches = sorted(matches, key=lambda x: x.distance)
+    good = []
+    for m,n in matches:
+        if m.distance < 0.75*n.distance:
+            good.append(m)
 
-    return matches
+    return good
 
 
 def drawMatches(img1, kp1, img2, kp2, matches_pos):
@@ -74,16 +80,17 @@ def find_homography(kp1, kp2, matches_pos):
     srcPoints = []
 
     for match in matches_pos:
-        dstPoints.append(kp1[match.queryIdx].pt)
-        srcPoints.append(kp2[match.trainIdx].pt)
+        dstPoints.append(kp2[match.trainIdx].pt)
+        srcPoints.append(kp1[match.queryIdx].pt)
     dstPoints = np.array(dstPoints)
     srcPoints = np.array(srcPoints)
 
     H_verify = cv2.findHomography(srcPoints, dstPoints, cv2.RANSAC, 5.0)
     H_verify = np.array(H_verify[0])
 
-    return H_verify
+    # np.save(f"H_base_veri_{i}.npy", H_verify)
 
+    return H_verify
 
 def Convert_xy(x, y):
     global center, f
@@ -154,137 +161,219 @@ def ProjectOntoCylinder(InitialImage):
 
     return TransformedImage, ti_x-min_x, ti_y
 
-
-def blending(img1, img2):
-    (hl, wl) = img1.shape[:2]
-    (hr, wr) = img2.shape[:2]
-    img_left_mask = np.zeros((hr, wr), dtype="int")
-    img_right_mask = np.zeros((hr, wr), dtype="int")
-    constant_width = 3  # constant width
-
-    for i in range(hl):
-        for j in range(wl):
-            if np.count_nonzero(img1[i, j]) > 0:
-                img_left_mask[i, j] = 1
-    for i in range(hr):
-        for j in range(wr):
-            if np.count_nonzero(img2[i, j]) > 0:
-                img_right_mask[i, j] = 1
-
-    overlap_mask = np.zeros((hr, wr), dtype="int")
-    for i in range(hr):
-        for j in range(wr):
-            if (np.count_nonzero(img_left_mask[i, j]) > 0 and np.count_nonzero(img_right_mask[i, j]) > 0):
-                overlap_mask[i, j] = 1
-
-    alpha_mask = np.zeros((hr, wr))  # alpha value depend on left image
-    for i in range(hr):
-        minIdx = maxIdx = -1
-        for j in range(wr):
-            if (overlap_mask[i, j] == 1 and minIdx == -1):
-                minIdx = j
-            if (overlap_mask[i, j] == 1):
-                maxIdx = j
-
-        if (minIdx == maxIdx):
-            continue
-
-        decrease_step = 1 / (maxIdx - minIdx)
-
-        middleIdx = int((maxIdx + minIdx) / 2)
-
-        # left
-        for j in range(minIdx, middleIdx + 1):
-            if (j >= middleIdx - constant_width):
-                alpha_mask[i, j] = 1 - (decrease_step * (j - minIdx))
-            else:
-                alpha_mask[i, j] = 1
-        for j in range(middleIdx + 1, maxIdx + 1):
-            if (j <= middleIdx + constant_width):
-                alpha_mask[i, j] = 1 - (decrease_step * (j - minIdx))
-            else:
-                alpha_mask[i, j] = 0
-
-    linearBlendingWithConstantWidth_img = np.copy(img2)
-    linearBlendingWithConstantWidth_img[:hl, :wl] = np.copy(img1)
-    for i in range(hr):
-        for j in range(wr):
-            if (np.count_nonzero(overlap_mask[i, j]) > 0):
-                linearBlendingWithConstantWidth_img[i, j] = alpha_mask[i, j] * img1[i, j] + (
-                    1 - alpha_mask[i, j]) * img2[i, j]
-
-    return linearBlendingWithConstantWidth_img
-
-
-def warp(img1, img2, H):
-    img_left, img_right = img1, img2
-    (hl, wl) = img_left.shape[:2]
-    (hr, wr) = img_right.shape[:2]
-    # create the (stitch)big image accroding the imgs height and width
-    stitch_img = np.zeros((max(hl, hr), wl + wr, 3), dtype="int")
-
-    # Transform Right image(the coordination of right image) to destination iamge(the coordination of left image) with HomoMat
-    inv_H = np.linalg.inv(H)
-    for i in range(stitch_img.shape[0]):
-        for j in range(stitch_img.shape[1]):
-            coor = np.array([j, i, 1])
-            img_right_coor = inv_H @ coor  # the coordination of right image
-            img_right_coor /= img_right_coor[2]
-
-            # you can try like nearest neighbors or interpolation
-            y, x = int(round(img_right_coor[0])), int(
-                round(img_right_coor[1]))  # y for width, x for height
-
-            # if the computed coordination not in the (hegiht, width) of right image, it's not need to be process
-            if (x < 0 or x >= hr or y < 0 or y >= wr):
+def linearBlending(img1, img2):
+        '''
+        linear Blending(also known as Feathering)
+        '''
+        img_left, img_right = img1, img2
+        (hl, wl) = img_left.shape[:2]
+        (hr, wr) = img_right.shape[:2]
+        img_left_mask = np.zeros((hr, wr), dtype="int")
+        img_right_mask = np.zeros((hr, wr), dtype="int")
+        
+        # find the left image and right image mask region(Those not zero pixels)
+        for i in range(hl):
+            for j in range(wl):
+                if np.count_nonzero(img_left[i, j]) > 0:
+                    img_left_mask[i, j] = 1
+        for i in range(hr):
+            for j in range(wr):
+                if np.count_nonzero(img_right[i, j]) > 0:
+                    img_right_mask[i, j] = 1
+        
+        # find the overlap mask(overlap region of two image)
+        overlap_mask = np.zeros((hr, wr), dtype="int")
+        for i in range(hr):
+            for j in range(wr):
+                if (np.count_nonzero(img_left_mask[i, j]) > 0 and np.count_nonzero(img_right_mask[i, j]) > 0):
+                    overlap_mask[i, j] = 1
+        
+        # compute the alpha mask to linear blending the overlap region
+        alpha_mask = np.zeros((hr, wr)) # alpha value depend on left image
+        for i in range(hr): 
+            minIdx = maxIdx = -1
+            for j in range(wr):
+                if (overlap_mask[i, j] == 1 and minIdx == -1):
+                    minIdx = j
+                if (overlap_mask[i, j] == 1):
+                    maxIdx = j
+            
+            if (minIdx == maxIdx): # represent this row's pixels are all zero, or only one pixel not zero
                 continue
-            # else we need the tranform for this pixel
-            stitch_img[i, j] = img_right[x, y]
+                
+            decrease_step = 1 / (maxIdx - minIdx)
+            for j in range(minIdx, maxIdx + 1):
+                alpha_mask[i, j] = 1 - (decrease_step * (j - minIdx))
+        
+        
+        
+        linearBlending_img = np.copy(img_right)
+        linearBlending_img[:hl, :wl] = np.copy(img_left)
+        # linear blending
+        for i in range(hr):
+            for j in range(wr):
+                if ( np.count_nonzero(overlap_mask[i, j]) > 0):
+                    linearBlending_img[i, j] = alpha_mask[i, j] * img_left[i, j] + (1 - alpha_mask[i, j]) * img_right[i, j]
+        
+        return linearBlending_img
 
-    return stitch_img
+def removeBlackBorder(img):
+        '''
+        Remove img's the black border 
+        '''
+        h, w = img.shape[:2]
+        reduced_h, reduced_w = h, w
+        # right to left
+        for col in range(w - 1, -1, -1):
+            all_black = True
+            for i in range(h):
+                if (np.count_nonzero(img[i, col]) > 0):
+                    all_black = False
+                    break
+            if (all_black == True):
+                reduced_w = reduced_w - 1
+                
+        # bottom to top 
+        for row in range(h - 1, -1, -1):
+            all_black = True
+            for i in range(reduced_w):
+                if (np.count_nonzero(img[row, i]) > 0):
+                    all_black = False
+                    break
+            if (all_black == True):
+                reduced_h = reduced_h - 1
+        
+        return img[:reduced_h, :reduced_w]
+    
+def trim(im):
+    im = Image.fromarray(np.uint8(im))
+    bg = Image.new(im.mode, im.size, im.getpixel((0,0)))
+    diff = ImageChops.difference(im, bg)
+    diff = ImageChops.add(diff, diff, 2.0, -100)
+    bbox = diff.getbbox()
+    if bbox:
+        return np.array(im.crop(bbox))
 
 
-def stitching(img1, img2, kp1, kp2, matches_pos):
-    print("stitching...")
-    H = find_homography(kp1, kp2, matches_pos)
-    img1_size = img1.shape  # (h, w)
-    img2_size = img2.shape  # (h, w)
-    corners_l = [[0, 0, 1], [0, img1_size[0]-1, 1], 
-                [img1_size[1]-1, 0, 1], [img1_size[1]-1, img1_size[0]-1, 1]]
-    corners_l = np.array(corners_l)
-    corners_r = []
-    for cor_l in corners_l:
-        cor_r = H @ cor_l.T
-        corners_r.append(cor_r)
-    corners_r = np.array(corners_r).astype('int8')
+def find_translation(img1, img2, H):
+    h1,w1 = img1.shape[:2]
+    h2,w2 = img2.shape[:2]
+    pts1 = np.float32([[0,0],[0,h1-1],[w1-1,h1-1],[w1-1,0]]).reshape(-1,1,2)
+    pts2 = np.float32([[0,0],[0,h2-1],[w2-1,h2-1],[w2-1,0]]).reshape(-1,1,2)
+    
 
-    x1_r = min(min(corners_r[:, 0]), 0)
-    y1_r = min(min(corners_r[:, 1]), 0)
-    output_size = (img2_size[1]+abs(int(x1_r)), img2_size[0]+np.abs(int(y1_r)))
+    pts1_ = cv2.perspectiveTransform(pts1, H)
+    pts = np.concatenate((pts2, pts1_), axis=0)
+    [xmin, ymin] = np.int32(pts.min(axis=0).ravel() - 0.5)
+    [xmax, ymax] = np.int32(pts.max(axis=0).ravel() + 0.5)
+    t = [-xmin,-ymin]
+    output_size = (xmax-xmin, ymax-ymin)
+    # output_size = (w1+abs(int(xmin)), h1+np.abs(int(ymin)))
 
-    A = [[1, 0, np.float64(-x1_r)],  # affine translation matrix
-         [0, 1, np.float64(-y1_r)],
+
+    A = [[1, 0, t[0]],  # affine translation matrix
+         [0, 1, t[1]],
          [0, 0, 1]]
+    A = np.array(A).astype("float64")
+    
+    return A, output_size, t
 
-    A = np.array(A).astype('float64')
-    H = A @ H
 
-    warp_src = cv2.warpPerspective(src=img1, M=H, dsize=output_size)
+def mix_and_match(leftImage, warpedImage):
+    i1y, i1x = leftImage.shape[:2]
+    i2y, i2x = warpedImage.shape[:2]
+    print (leftImage[-1,-1])
+
+    # t = time.time()
+    black_l = np.where(leftImage == np.array([0,0,0]))
+    black_wi = np.where(warpedImage == np.array([0,0,0]))
+    # print (time.time() - t)
+    print (black_l[-1])
+
+    for i in range(0, i1x):
+        for j in range(0, i1y):
+            try:
+                if(np.array_equal(leftImage[j,i],np.array([0,0,0])) and  np.array_equal(warpedImage[j,i],np.array([0,0,0]))):
+                    # print "BLACK"
+                    # instead of just putting it with black, 
+                    # take average of all nearby values and avg it.
+                    warpedImage[j,i] = [0, 0, 0]
+                else:
+                    if(np.array_equal(warpedImage[j,i],[0,0,0])):
+                        # print "PIXEL"
+                        warpedImage[j,i] = leftImage[j,i]
+                    else:
+                        if not np.array_equal(leftImage[j,i], [0,0,0]):
+                            bw, gw, rw = warpedImage[j,i]
+                            bl,gl,rl = leftImage[j,i]
+                            # b = (bl+bw)/2
+                            # g = (gl+gw)/2
+                            # r = (rl+rw)/2
+                            warpedImage[j, i] = [bl,gl,rl]
+            except:
+                pass
+    # cv2.imshow("waRPED mix", warpedImage)
+    # cv2.waitKey()
+    return warpedImage
+
+
+def warp(img1, img2, H, A, output_size, i):
+    warp_src = cv2.warpPerspective(src=img1, M=A @ H, dsize=output_size)
     warp_dst = cv2.warpPerspective(src=img2, M=A, dsize=output_size)
+    stitched_image = mix_and_match(warp_dst, warp_src)
+    cv2.imwrite(f"warpped_dst{i}_verify.jpg", warp_dst)
+    cv2.imwrite(f"warpped_src{i}_verify.jpg", warp_src)
+    cv2.imwrite(f"stitched{i}_verify.jpg", stitched_image)
 
-    warp_src_cylinProject, _, _ = ProjectOntoCylinder(warp_src)
-    warp_dst_cylinProject, _, _ = ProjectOntoCylinder(warp_dst)
-    blended_image = blending(warp_src_cylinProject, warp_dst_cylinProject)
+    return stitched_image
 
-    creat_im_window("warp_src_verify", warp_src_cylinProject)
-    creat_im_window("warp_dst_verify", warp_dst_cylinProject)
-    creat_im_window("blended image", blended_image)
-    im_show()
-    cv2.imwrite("warp_src_verify.jpg", warp_src_cylinProject)
-    cv2.imwrite("warp_dst_verify.jpg", warp_dst_cylinProject)
-    cv2.imwrite("blended_image.jpg", blended_image)
+def stitching(imgs, homographies, translations, output_sizes, ts):
+    print("stitching...")
+    
+    H_list = []
+    A_list = []
+    for i in range(len(homographies)):
+        H = homographies[i]
+        A = translations[i]
+        for j in range(i+1, len(homographies)):
+            H = H @ homographies[j]
+            A = A @ translations[j]
+        H_list.append(H)
+        A_list.append(A)
 
-    return blended_image
+    warpped_imgs = []
+    for i in  range(len(images)-1):
+        warp_src = cv2.warpPerspective(src=imgs[i], M=A_list[i] @ H_list[i], dsize=output_sizes[i])
+        warpped_imgs.append(warp_src)
+        cv2.imwrite(f"warp_src{i}_verify.jpg", warp_src)
+
+    warp_dst = cv2.warpPerspective(src=imgs[-1], M=A_list[-1] , dsize=output_sizes[-1])
+    cv2.imwrite("warp_dst_verify.jpg", warp_dst)
+    warpped_imgs.append(warp_dst)
+
+    # stitched_image = warp_dst
+    stitched_images = []
+    for i in range(len(warpped_imgs)-1, 0, -1):
+        # stitched_image = warpped_imgs[i]
+        # h1, w1 = stitched_image.shape[:2]
+        # h2, w2 = warpped_imgs[i+1].shape[:2]
+        # t = ts[i]
+        # stitched_image[t[1]:h1+t[1], t[0]:w1+t[0]] = warpped_imgs[i+1][t[1]:h1+t[1], t[0]:w1+t[0]]
+
+        stitched_image = mix_and_match(warpped_imgs[i-1], warpped_imgs[i])
+        stitched_images.append(stitched_image)
+        cv2.imwrite(f"blended_image_verify{i}.jpg", stitched_image)
+
+    for i in range(len(stitched_images)-1):
+        stitched_image = mix_and_match(stitched_images[i], stitched_images[i+1])
+
+    # creat_im_window("warp_src_verify", warp_src)
+    # creat_im_window("warp_dst_verify", warp_dst)
+    # creat_im_window("stitched_image_verify", stitched_image)
+    # im_show()
+    cv2.imwrite("stitched_image_verify.jpg", stitched_image)
+
+    return stitched_image
 
 
 if __name__ == '__main__':
@@ -296,32 +385,40 @@ if __name__ == '__main__':
         images.append(img)
         images_gray.append(img_gray)
 
-    # kp_list = []
-    # des_list = []
-    # for i in range(len(images)):
-    #     kp, des = SIFT(images_gray[i])
-    #     kp_list.append(kp)
-    #     des_list.append(des)
-
-    # goodMatch_pos_list = []
-    # for i in range(len(images)-1):
-    #     goodMatch_pos = KNN(kp_list[i], kp_list[i+1], des_list[i], des_list[i+1])
-    #     goodMatch_pos_list.append(goodMatch_pos)
-
+    
+    homographies = []
+    translations = []
+    output_sizes = []
+    ts = []
     for i in range(len(images)-1):
-        if i==0:
-            kp1, des1 = SIFT(images_gray[i])
-            kp2, des2 = SIFT(images_gray[i+1])
-            goodMatch_pos = KNN(kp1, kp2, des1, des2)
-            result_imgL_to_imgR = stitching(images[i], images[i+1], kp1, kp2, goodMatch_pos)
-        else:
-            kp1, des1 = SIFT(img_to_gray(result_imgL_to_imgR))
-            kp2, des2 = SIFT(images_gray[i+1])
-            goodMatch_pos = KNN(kp1, kp2, des1, des2)
-            drawMatches(result_imgL_to_imgR, kp1, images[i+1], kp2, goodMatch_pos)
-            result_imgL_to_imgR = stitching(result_imgL_to_imgR, images[i+1], kp1, kp2, goodMatch_pos)
+        kp1, des1 = SIFT(images_gray[i])
+        kp2, des2 = SIFT(images_gray[i+1])
+        goodMatch_pos = KNN(kp1, kp2, des1, des2)
+        H = find_homography(kp1, kp2, goodMatch_pos)
+        homographies.append(H)
+        A, output_size, t = find_translation(images[i], images[i+1], H)
+        translations.append(A)
+        output_sizes.append(output_size)
+        ts.append(t)
 
-    # result_img1_to_img2 = stitching(images[0], images[1], kp_list[0], kp_list[1], goodMatch_pos_list[0])
-    # result_img12_to_img3 = stitching(result_img1_to_img2, images[2], kp_list[1], kp_list[2], goodMatch_pos_list[1])
-    creat_im_window("result", result_imgL_to_imgR)
+    # kp1, des1 = SIFT(images_gray[1])
+    # kp2, des2 = SIFT(images_gray[2])
+    # goodMatch_pos = KNN(kp1, kp2, des1, des2)
+    # H = find_homography(kp1, kp2, goodMatch_pos)
+    # A, output_size, t = find_translation(images[1], images[2], H)
+    # warp1 = warp(images[1],images[2], H, A, output_size, 1)
+
+    # kp1, des1 = SIFT(images_gray[0])
+    # kp2, des2 = SIFT(images_gray[1])
+    # goodMatch_pos = KNN(kp1, kp2, des1, des2)
+    # H = find_homography(kp1, kp2, goodMatch_pos)
+    # A, output_size, t = find_translation(images[0], warp1, H)
+    # warp0 = warp(images[0], images[1], H, A, output_size, 0)
+
+    # result = mix_and_match(warp0, warp1)
+    result = stitching(images, homographies, translations, output_sizes, ts)
+
+
+    cv2.imwrite(f"result.jpg", result)
+    creat_im_window("result", result)
     im_show()
